@@ -908,7 +908,10 @@ struct battery_chg_dev {
 	struct mutex			bypass_lock;
 	int				bypass_target;   /* -1 idle, 0 disable, 1 enable in flight */
 	int				bypass_applied;  /* last confirmed-applied state, 0 or 1 */
-	int				bypass_saved_fastcharge_mode; /* fastcharge_enable mode to restore on revert */
+	u32				bypass_saved_smart_chg;   /* raw fastcharge pair to restore */
+	u32				bypass_saved_sport_mode;
+	bool				bypass_saved_valid;
+	bool				bypass_auto_revert;   /* one-shot rollback in flight */
 	struct bypass_step {
 		u32 prop_id;
 		u32 val;
@@ -1640,6 +1643,41 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 	struct power_supply_desc *desc;
 	struct psy_state *pst;
 	int rc, i;
+
+	/*
+	 * Bypass charging is meaningless without a charger: if an unplug
+	 * notification brought us here while bypass was applied or in
+	 * flight, drop the stale state so the sysfs node never lies.
+	 */
+	mutex_lock(&bcdev->bypass_lock);
+	if (bcdev->bypass_applied || bcdev->bypass_target != -1) {
+		bool online = false;
+
+		mutex_unlock(&bcdev->bypass_lock);
+		rc = read_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_USB],
+					USB_ONLINE);
+		if (!rc && bcdev->psy_list[PSY_TYPE_USB].prop[USB_ONLINE])
+			online = true;
+		if (!online && bcdev->num_usb_ports == 2) {
+			rc = read_property_id(bcdev,
+					&bcdev->psy_list[PSY_TYPE_USB_2],
+					USB_ONLINE);
+			if (!rc && bcdev->psy_list[PSY_TYPE_USB_2].prop[USB_ONLINE])
+				online = true;
+		}
+		if (!online) {
+			cancel_delayed_work_sync(&bcdev->bypass_charging_work);
+			mutex_lock(&bcdev->bypass_lock);
+			bcdev->bypass_target = -1;
+			bcdev->bypass_applied = 0;
+			bcdev->bypass_auto_revert = false;
+			mutex_unlock(&bcdev->bypass_lock);
+			dev_info(bcdev->dev,
+				 "bypass_charging: charger removed, state reset\n");
+		}
+	} else {
+		mutex_unlock(&bcdev->bypass_lock);
+	}
 
 	for (i = 0; i < NUM_USB_PORTS; i++) {
 		if (!bcdev->usb_active[i])
@@ -3916,6 +3954,30 @@ static ssize_t fastcharge_enable_show(struct class *c,
 static CLASS_ATTR_RW(fastcharge_enable);
 
 /*
+ * Fills the revert step list: undo the bypass command pair, then restore
+ * the raw (smart_chg, sport_mode) fastcharge state snapshotted at engage
+ * time. Raw restore avoids the mode-decode asymmetry between
+ * fastcharge_get_mode() and fastcharge_mode_to_steps(), whose show/store
+ * mappings are not inverses of each other.
+ * Caller holds bypass_lock.
+ */
+static void bypass_build_revert(struct battery_chg_dev *bcdev)
+{
+	int n = 0;
+
+	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 2 };
+	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 8 };
+	if (bcdev->bypass_saved_valid) {
+		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG,
+					bcdev->bypass_saved_smart_chg };
+		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SPORT_MODE,
+					bcdev->bypass_saved_sport_mode };
+	}
+	bcdev->bypass_step_count = n;
+	bcdev->bypass_step_idx = 0;
+}
+
+/*
  * Bypass charging: runs off adapter power without cycling the battery.
  * Sequencing confirmed by manual testing:
  *   engage:  disable fastcharge (mode 0), then smart_chg=0x09, smart_chg=3
@@ -3935,6 +3997,7 @@ static void bypass_charging_work_fn(struct work_struct *work)
 {
 	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
 					struct battery_chg_dev, bypass_charging_work);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
 	struct bypass_step step;
 	int idx, target, rc;
 
@@ -3948,32 +4011,69 @@ static void bypass_charging_work_fn(struct work_struct *work)
 	step = bcdev->bypass_steps[idx];
 	mutex_unlock(&bcdev->bypass_lock);
 
-	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-				step.prop_id, step.val);
+	rc = write_property_id(bcdev, pst, step.prop_id, step.val);
 	if (rc < 0) {
 		dev_err(bcdev->dev,
-			"bypass_charging: step %d (prop %u val %u) failed, aborting: %d\n",
+			"bypass_charging: step %d (prop %u val %u) failed: %d\n",
 			idx, step.prop_id, step.val, rc);
-		mutex_lock(&bcdev->bypass_lock);
-		bcdev->bypass_target = -1;
-		mutex_unlock(&bcdev->bypass_lock);
-		return;
+		goto fail;
 	}
 
 	mutex_lock(&bcdev->bypass_lock);
 	bcdev->bypass_step_idx++;
-	if (bcdev->bypass_step_idx >= bcdev->bypass_step_count) {
-		bcdev->bypass_applied = target;
-		bcdev->bypass_target = -1;
-		mutex_unlock(&bcdev->bypass_lock);
-		dev_info(bcdev->dev, "bypass_charging: %s sequence complete\n",
-			 target ? "enable" : "disable");
-		return;
-	}
+	idx = bcdev->bypass_step_idx;
 	mutex_unlock(&bcdev->bypass_lock);
 
-	schedule_delayed_work(&bcdev->bypass_charging_work,
-			       msecs_to_jiffies(BYPASS_STEP_DELAY_MS));
+	if (idx < bcdev->bypass_step_count) {
+		schedule_delayed_work(&bcdev->bypass_charging_work,
+					msecs_to_jiffies(BYPASS_STEP_DELAY_MS));
+		return;
+	}
+
+	/*
+	 * Sequence finished. For engage, confirm the co-processor actually
+	 * resolved the navigation scene: battery_chg_write() can return
+	 * success without the firmware applying anything, so an unverified
+	 * "applied" would make the sysfs node lie.
+	 */
+	if (target == 1) {
+		rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
+		if (!rc && pst->prop[XM_PROP_SMART_CHG] !=
+					SMART_CHG_SCENE_NAVIGATION) {
+			dev_err(bcdev->dev,
+				"bypass_charging: engage not effective (scene %u != %d), rolling back\n",
+				pst->prop[XM_PROP_SMART_CHG],
+				SMART_CHG_SCENE_NAVIGATION);
+			goto fail;
+		}
+	}
+
+	mutex_lock(&bcdev->bypass_lock);
+	bcdev->bypass_applied = target;
+	bcdev->bypass_target = -1;
+	bcdev->bypass_auto_revert = false;
+	mutex_unlock(&bcdev->bypass_lock);
+	dev_info(bcdev->dev, "bypass_charging: %s sequence complete\n",
+		 target ? "enable" : "disable");
+	return;
+
+fail:
+	mutex_lock(&bcdev->bypass_lock);
+	if (target == 1 && !bcdev->bypass_auto_revert) {
+		/* one-shot best-effort rollback of a half-engaged state */
+		bypass_build_revert(bcdev);
+		bcdev->bypass_target = 0;
+		bcdev->bypass_auto_revert = true;
+		mutex_unlock(&bcdev->bypass_lock);
+		schedule_delayed_work(&bcdev->bypass_charging_work,
+					msecs_to_jiffies(BYPASS_STEP_DELAY_MS));
+		return;
+	}
+	bcdev->bypass_target = -1;
+	bcdev->bypass_applied = 0;
+	bcdev->bypass_auto_revert = false;
+	mutex_unlock(&bcdev->bypass_lock);
+	dev_err(bcdev->dev, "bypass_charging: sequence aborted, state cleared\n");
 }
 
 static ssize_t bypass_charging_enable_store(struct class *c,
@@ -3982,11 +4082,29 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
-	int val, mode, n = 0;
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 smart, sport;
+	int val, n, rc;
 
 	if (kstrtoint(buf, 0, &val))
 		return -EINVAL;
 	val = !!val;
+
+	if (atomic_read(&bcdev->state) == PMIC_GLINK_STATE_DOWN)
+		return -ENOTCONN;
+
+	/*
+	 * Snapshot the fastcharge state before taking the lock: these are
+	 * glink round-trips and must not sleep under bypass_lock.
+	 */
+	rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
+	if (rc < 0)
+		return rc;
+	smart = pst->prop[XM_PROP_SMART_CHG];
+	rc = read_property_id(bcdev, pst, XM_PROP_SPORT_MODE);
+	if (rc < 0)
+		return rc;
+	sport = pst->prop[XM_PROP_SPORT_MODE];
 
 	mutex_lock(&bcdev->bypass_lock);
 	if (bcdev->bypass_target != -1) {
@@ -4000,25 +4118,22 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 	}
 
 	if (val) {
-		mode = fastcharge_get_mode(bcdev);
-		if (mode < 0) {
-			mutex_unlock(&bcdev->bypass_lock);
-			return mode;
-		}
-		bcdev->bypass_saved_fastcharge_mode = mode;
+		bcdev->bypass_saved_smart_chg = smart;
+		bcdev->bypass_saved_sport_mode = sport;
+		bcdev->bypass_saved_valid = true;
 
-		n += fastcharge_mode_to_steps(0, &bcdev->bypass_steps[n]);
+		n = fastcharge_mode_to_steps(0, bcdev->bypass_steps);
+		if (n < 0) {
+			mutex_unlock(&bcdev->bypass_lock);
+			return n;
+		}
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 0x09 };
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 3 };
+		bcdev->bypass_step_count = n;
+		bcdev->bypass_step_idx = 0;
 	} else {
-		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 2 };
-		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 8 };
-		n += fastcharge_mode_to_steps(bcdev->bypass_saved_fastcharge_mode,
-					      &bcdev->bypass_steps[n]);
+		bypass_build_revert(bcdev);
 	}
-
-	bcdev->bypass_step_count = n;
-	bcdev->bypass_step_idx = 0;
 	bcdev->bypass_target = val;
 	mutex_unlock(&bcdev->bypass_lock);
 

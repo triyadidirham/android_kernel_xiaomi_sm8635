@@ -82,7 +82,7 @@ ATOMIC_NOTIFIER_HEAD(pen_charge_state_notifier);
  * run in sequence with a real gap between them rather than back-to-back
  * (proven manually with `sleep` between writes).
  */
-#define BYPASS_MAX_STEPS		4
+#define BYPASS_MAX_STEPS		6
 #define BYPASS_STEP_DELAY_MS		1000
 
 #define CHG_DEBUG_DATA_LEN	200
@@ -1091,7 +1091,7 @@ static int battery_chg_fw_write(struct battery_chg_dev *bcdev, void *data,
 	int rc;
 
 	down_read(&bcdev->state_sem);
-	if (atomic_read(&bcdev->state) == PMIC_GLINK_STATE_DOWN) {
+	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP) {
 		pr_debug("glink state is down\n");
 		up_read(&bcdev->state_sem);
 		return -ENOTCONN;
@@ -1127,7 +1127,7 @@ static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 	 * pmic_glink_write() is not attempted until pmic glink is up.
 	 */
 	down_read(&bcdev->state_sem);
-	if (atomic_read(&bcdev->state) == PMIC_GLINK_STATE_DOWN) {
+	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP) {
 		pr_debug("glink state is down\n");
 		up_read(&bcdev->state_sem);
 		return 0;
@@ -1666,12 +1666,12 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 				online = true;
 		}
 		if (!online) {
-			cancel_delayed_work_sync(&bcdev->bypass_charging_work);
 			mutex_lock(&bcdev->bypass_lock);
 			bcdev->bypass_target = -1;
 			bcdev->bypass_applied = 0;
 			bcdev->bypass_auto_revert = false;
 			mutex_unlock(&bcdev->bypass_lock);
+			cancel_delayed_work(&bcdev->bypass_charging_work);
 			dev_info(bcdev->dev,
 				 "bypass_charging: charger removed, state reset\n");
 		}
@@ -4090,7 +4090,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 		return -EINVAL;
 	val = !!val;
 
-	if (atomic_read(&bcdev->state) == PMIC_GLINK_STATE_DOWN)
+	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP)
 		return -ENOTCONN;
 
 	/*

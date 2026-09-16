@@ -71,17 +71,22 @@ ATOMIC_NOTIFIER_HEAD(pen_charge_state_notifier);
 #define DEFAULT_RESTRICT_FCC_UA		1000000
 
 /*
- * Bypass-charging step sequencing. Confirmed by manual testing: engaging
- * bypass is smart_chg=0x09 then smart_chg=3 (no sport_mode write needed —
- * see the comment above bypass_charging_enable_store for why), and
- * reverting is smart_chg=2 then smart_chg=8. Disabling fastcharge before
- * engaging, and restoring it after reverting, is 2 more writes each way
- * (see fastcharge_mode_to_steps) — 4 steps total in either direction.
+ * Bypass-charging step sequencing, derived from the scene it targets:
+ *   engage:  smart_chg=(scene-1), smart_chg=3
+ *   revert:  smart_chg=(scene-2), smart_chg=2
+ * Confirmed by hand over adb shell on two scenes (NAVIGATION=10 and
+ * TGAME=18) — same two values both times, and for disable specifically,
+ * confirmed order-insensitive (ran both (scene-2)-then-2 and
+ * 2-then-(scene-2) across the two scenes, both landed on scene 0).
+ * Enable has only been run (scene-1)-then-3, never reversed, so don't
+ * assume it's order-insensitive too until that's actually tried.
+ * Change BYPASS_TARGET_SCENE to retarget a different scene; nothing
+ * else below needs to change.
  * smart_chg's readback is a resolved firmware scene ID, not an echo of
- * what was written, and depends on write order/context, so steps must
- * run in sequence with a real gap between them rather than back-to-back
- * (proven manually with `sleep` between writes).
+ * what was written, so steps run one at a time with a real gap between
+ * them (delayed work, not back-to-back writes).
  */
+#define BYPASS_TARGET_SCENE		SMART_CHG_SCENE_TGAME
 #define BYPASS_MAX_STEPS		6
 #define BYPASS_STEP_DELAY_MS		1000
 
@@ -3965,8 +3970,8 @@ static void bypass_build_revert(struct battery_chg_dev *bcdev)
 {
 	int n = 0;
 
+	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 2 };
 	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 2 };
-	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 8 };
 	if (bcdev->bypass_saved_valid) {
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG,
 					bcdev->bypass_saved_smart_chg };
@@ -3979,17 +3984,14 @@ static void bypass_build_revert(struct battery_chg_dev *bcdev)
 
 /*
  * Bypass charging: runs off adapter power without cycling the battery.
- * Sequencing confirmed by manual testing:
- *   engage:  disable fastcharge (mode 0), then smart_chg=0x09, smart_chg=3
- *   revert:  smart_chg=2, smart_chg=8, then restore whatever fastcharge
- *            mode was active before bypass was engaged
- * No sport_mode write is needed in either direction — smart_chg is a
- * command channel into the charging co-processor's own scene state
- * machine, not a plain register: the value read back is the resolved
- * scene ID given the opcode and whatever context the prior write armed,
- * not an echo of what was written (confirmed: writing 0x09 then 3 reads
- * back as scene 10, and 2 then 8 reads back as scene 0). sport_mode was
- * an earlier recipe's unrelated correlate, not a cause.
+ * Targets whatever scene BYPASS_TARGET_SCENE is set to (see the define
+ * above). Engage/revert values are derived from that scene number —
+ * see this file's top-of-file comment for the confirmed (scene-1)/3
+ * and (scene-2)/2 pattern and what's still untested about it (enable
+ * order specifically). Restores whatever fastcharge mode was active
+ * before bypass was engaged. No sport_mode write is needed either
+ * direction.
+ *
  * Each write needs to settle before the next, so this executes as a
  * delayed-work sequence (see bypass_charging_work_fn) instead of inline.
  */
@@ -4032,18 +4034,18 @@ static void bypass_charging_work_fn(struct work_struct *work)
 
 	/*
 	 * Sequence finished. For engage, confirm the co-processor actually
-	 * resolved the navigation scene: battery_chg_write() can return
-	 * success without the firmware applying anything, so an unverified
+	 * resolved the TGAME scene: battery_chg_write() can return success
+	 * without the firmware applying anything, so an unverified
 	 * "applied" would make the sysfs node lie.
 	 */
 	if (target == 1) {
 		rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
 		if (!rc && pst->prop[XM_PROP_SMART_CHG] !=
-					SMART_CHG_SCENE_NAVIGATION) {
+					BYPASS_TARGET_SCENE) {
 			dev_err(bcdev->dev,
 				"bypass_charging: engage not effective (scene %u != %d), rolling back\n",
 				pst->prop[XM_PROP_SMART_CHG],
-				SMART_CHG_SCENE_NAVIGATION);
+				BYPASS_TARGET_SCENE);
 			goto fail;
 		}
 	}
@@ -4127,7 +4129,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 			mutex_unlock(&bcdev->bypass_lock);
 			return n;
 		}
-		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 0x09 };
+		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 1 };
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 3 };
 		bcdev->bypass_step_count = n;
 		bcdev->bypass_step_idx = 0;

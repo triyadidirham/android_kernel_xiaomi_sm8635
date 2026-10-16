@@ -80,13 +80,14 @@ ATOMIC_NOTIFIER_HEAD(pen_charge_state_notifier);
  * 2-then-(scene-2) across the two scenes, both landed on scene 0).
  * Enable has only been run (scene-1)-then-3, never reversed, so don't
  * assume it's order-insensitive too until that's actually tried.
- * Change BYPASS_TARGET_SCENE to retarget a different scene; nothing
- * else below needs to change.
+ * Selectable scenes (navigation, tgame, nolimit) live in bypass_modes[]; userspace picks
+ * one through bypass_charging_mode before toggling bypass_charging_enable.
+ * The scene is latched when bypass engages, so revert always undoes the
+ * scene that was actually engaged even if the selector changes meanwhile.
  * smart_chg's readback is a resolved firmware scene ID, not an echo of
  * what was written, so steps run one at a time with a real gap between
  * them (delayed work, not back-to-back writes).
  */
-#define BYPASS_TARGET_SCENE		SMART_CHG_SCENE_TGAME
 #define BYPASS_MAX_STEPS		6
 #define BYPASS_STEP_DELAY_MS		1000
 
@@ -913,6 +914,8 @@ struct battery_chg_dev {
 	struct mutex			bypass_lock;
 	int				bypass_target;   /* -1 idle, 0 disable, 1 enable in flight */
 	int				bypass_applied;  /* last confirmed-applied state, 0 or 1 */
+	int				bypass_mode_sel; /* index into bypass_modes[], set via sysfs */
+	int				bypass_scene;    /* scene latched at engage, used by revert */
 	u32				bypass_saved_smart_chg;   /* raw fastcharge pair to restore */
 	u32				bypass_saved_sport_mode;
 	bool				bypass_saved_valid;
@@ -3964,13 +3967,13 @@ static CLASS_ATTR_RW(fastcharge_enable);
  * time. Raw restore avoids the mode-decode asymmetry between
  * fastcharge_get_mode() and fastcharge_mode_to_steps(), whose show/store
  * mappings are not inverses of each other.
- * Caller holds bypass_lock.
+ * Uses the scene latched at engage time. Caller holds bypass_lock.
  */
 static void bypass_build_revert(struct battery_chg_dev *bcdev)
 {
 	int n = 0;
 
-	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 2 };
+	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, bcdev->bypass_scene - 2 };
 	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 2 };
 	if (bcdev->bypass_saved_valid) {
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG,
@@ -3984,8 +3987,8 @@ static void bypass_build_revert(struct battery_chg_dev *bcdev)
 
 /*
  * Bypass charging: runs off adapter power without cycling the battery.
- * Targets whatever scene BYPASS_TARGET_SCENE is set to (see the define
- * above). Engage/revert values are derived from that scene number —
+ * Targets the scene selected via bypass_charging_mode (see bypass_modes[]).
+ * Engage/revert values are derived from that scene number —
  * see this file's top-of-file comment for the confirmed (scene-1)/3
  * and (scene-2)/2 pattern and what's still untested about it (enable
  * order specifically). Restores whatever fastcharge mode was active
@@ -4034,18 +4037,18 @@ static void bypass_charging_work_fn(struct work_struct *work)
 
 	/*
 	 * Sequence finished. For engage, confirm the co-processor actually
-	 * resolved the TGAME scene: battery_chg_write() can return success
+	 * resolved the latched scene: battery_chg_write() can return success
 	 * without the firmware applying anything, so an unverified
 	 * "applied" would make the sysfs node lie.
 	 */
 	if (target == 1) {
 		rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
 		if (!rc && pst->prop[XM_PROP_SMART_CHG] !=
-					BYPASS_TARGET_SCENE) {
+					(u32)bcdev->bypass_scene) {
 			dev_err(bcdev->dev,
 				"bypass_charging: engage not effective (scene %u != %d), rolling back\n",
 				pst->prop[XM_PROP_SMART_CHG],
-				BYPASS_TARGET_SCENE);
+				bcdev->bypass_scene);
 			goto fail;
 		}
 	}
@@ -4078,6 +4081,21 @@ fail:
 	dev_err(bcdev->dev, "bypass_charging: sequence aborted, state cleared\n");
 }
 
+/*
+ * Selectable bypass scenes. Index 0 (navigation) is the default. Add a
+ * row here to expose another scene; the engage/revert sequence is
+ * derived from the scene ID automatically.
+ */
+static const struct bypass_mode {
+	const char *name;
+	int scene;
+} bypass_modes[] = {
+	{ "navigation",	SMART_CHG_SCENE_NAVIGATION },
+	{ "tgame",		SMART_CHG_SCENE_TGAME },
+	{ "nolimit",		SMART_CHG_SCENE_NOLIMIT },
+};
+#define BYPASS_NUM_MODES	((int)ARRAY_SIZE(bypass_modes))
+
 static ssize_t bypass_charging_enable_store(struct class *c,
 				struct class_attribute *attr,
 				const char *buf, size_t count)
@@ -4086,7 +4104,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 						battery_class);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
 	u32 smart, sport;
-	int val, n, rc;
+	int val, n, rc, scene;
 
 	if (kstrtoint(buf, 0, &val))
 		return -EINVAL;
@@ -4120,6 +4138,9 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 	}
 
 	if (val) {
+		/* latch the selected scene so revert undoes exactly this one */
+		scene = bypass_modes[bcdev->bypass_mode_sel].scene;
+		bcdev->bypass_scene = scene;
 		bcdev->bypass_saved_smart_chg = smart;
 		bcdev->bypass_saved_sport_mode = sport;
 		bcdev->bypass_saved_valid = true;
@@ -4129,7 +4150,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 			mutex_unlock(&bcdev->bypass_lock);
 			return n;
 		}
-		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 1 };
+		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, scene - 1 };
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 3 };
 		bcdev->bypass_step_count = n;
 		bcdev->bypass_step_idx = 0;
@@ -4165,6 +4186,58 @@ static ssize_t bypass_charging_enable_show(struct class *c,
 			  in_flight ? "-pending" : "");
 }
 static CLASS_ATTR_RW(bypass_charging_enable);
+
+/*
+ * Selects which thermal scene the next bypass engage will use. Accepts a
+ * mode name or its index. Takes effect on the next 0->1 transition of
+ * bypass_charging_enable; an already-engaged bypass keeps its latched scene.
+ */
+static ssize_t bypass_charging_mode_store(struct class *c,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int i, idx = -1;
+	u32 num;
+
+	for (i = 0; i < BYPASS_NUM_MODES; i++) {
+		if (sysfs_streq(buf, bypass_modes[i].name)) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0) {
+		if (kstrtou32(buf, 0, &num) || num >= BYPASS_NUM_MODES)
+			return -EINVAL;
+		idx = num;
+	}
+
+	mutex_lock(&bcdev->bypass_lock);
+	bcdev->bypass_mode_sel = idx;
+	mutex_unlock(&bcdev->bypass_lock);
+
+	return count;
+}
+
+static ssize_t bypass_charging_mode_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int i, sel, len = 0;
+
+	mutex_lock(&bcdev->bypass_lock);
+	sel = bcdev->bypass_mode_sel;
+	mutex_unlock(&bcdev->bypass_lock);
+
+	for (i = 0; i < BYPASS_NUM_MODES; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%s%s%s",
+				 i ? " " : "", i == sel ? "[" : "",
+				 bypass_modes[i].name, i == sel ? "]" : "");
+	return len + scnprintf(buf + len, PAGE_SIZE - len, "\n");
+}
+static CLASS_ATTR_RW(bypass_charging_mode);
 
 QTI_CHARGER_RO_SHOW(usb_typec_compliant, PSY_TYPE_USB, USB_TYPEC_COMPLIANT);
 
@@ -10315,6 +10388,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_cc_toggle.attr,
 	&class_attr_smart_chg.attr,
 	&class_attr_bypass_charging_enable.attr,
+	&class_attr_bypass_charging_mode.attr,
 	&class_attr_low_fast_para.attr,
 	&class_attr_lowfast_sw_para.attr,
 	&class_attr_smart_sic_mode.attr,
@@ -11288,6 +11362,8 @@ static int battery_chg_probe(struct platform_device *pdev)
 	mutex_init(&bcdev->bypass_lock);
 	bcdev->bypass_target = -1;
 	bcdev->bypass_applied = 0;
+	bcdev->bypass_mode_sel = 0;
+	bcdev->bypass_scene = bypass_modes[0].scene;
 	INIT_DELAYED_WORK(&bcdev->bypass_charging_work, bypass_charging_work_fn);
 
 #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)

@@ -1,0 +1,20 @@
+What:           /sys/class/qcom-battery/bypass_charging_enable
+Date:           November 2026
+Contact:        peridot device maintainers
+Description:
+                Enables Xiaomi firmware scene-based adapter bypass charging.
+                Write 1 to request bypass and 0 to restore the charger scene
+                captured before bypass. Reads return 0 or 1; while the
+                asynchronous transition runs they return 0-pending or
+                1-pending. A second request during transition returns EBUSY.
+                Enabling without an online USB supply returns ENODEV. Cable
+                removal automatically restores the captured charger scene.
+
+What:           /sys/class/qcom-battery/bypass_charging_mode
+Date:           November 2026
+Contact:        peridot device maintainers
+Description:
+                Selects the Xiaomi smart-charging scene used for bypass.
+                Accepted values are navigation, tgame, and nolimit. Reading
+                lists all values and encloses the selected value in brackets.
+                The mode cannot change while bypass is active or transitioning.

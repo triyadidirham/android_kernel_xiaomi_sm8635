@@ -839,6 +839,7 @@ struct battery_chg_dev {
 	bool				chg_ctrl_en;
 	struct mutex			bypass_charging_lock;
 	struct delayed_work		bypass_charging_work;
+	int				fastcharge_mode;
 	bool				bypass_charging_enabled;
 	bool				bypass_charging_target;
 	bool				bypass_charging_pending;
@@ -3789,86 +3790,75 @@ static ssize_t charge_control_en_show(struct class *c,
 static CLASS_ATTR_RW(charge_control_en);
 
 static ssize_t fastcharge_enable_store(struct class *c,
-                    struct class_attribute *attr,
-                    const char *buf, size_t count)
+        struct class_attribute *attr, const char *buf, size_t count)
 {
-    struct battery_chg_dev *bcdev =
-        container_of(c, struct battery_chg_dev, battery_class);
-    int mode;
-    int rc;
+        struct battery_chg_dev *bcdev = container_of(c,
+                        struct battery_chg_dev, battery_class);
+        int mode, rc;
 
-    rc = kstrtoint(buf, 10, &mode);
-    if (rc)
-        return -EINVAL;
+        rc = kstrtoint(buf, 0, &mode);
+        if (rc < 0)
+                return rc;
 
-    switch (mode) {
-    case 0:
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SMART_CHG, 0x8);
-        if (rc < 0)
-            return rc;
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SPORT_MODE, 0);
-        if (rc < 0)
-            return rc;
-        break;
-    case 1:
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SMART_CHG, 0x9);
-        if (rc < 0)
-            return rc;
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SPORT_MODE, 0);
-        if (rc < 0)
-            return rc;
-        break;
-    case 2:
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SMART_CHG, 0x9);
-        if (rc < 0)
-            return rc;
-        rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-                               XM_PROP_SPORT_MODE, 1);
-        if (rc < 0)
-            return rc;
-        break;
-    default:
-        return -EINVAL;
-    }
+        if (mode < 0 || mode > 2)
+                return -EINVAL;
 
-    return count;
+        mutex_lock(&bcdev->bypass_charging_lock);
+        if (bcdev->bypass_charging_enabled ||
+            bcdev->bypass_charging_pending) {
+                rc = -EBUSY;
+                goto out;
+        }
+
+        switch (mode) {
+        case 0:
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SMART_CHG, 0x8);
+                if (rc < 0)
+                        goto out;
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SPORT_MODE, 0);
+                break;
+        case 1:
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SMART_CHG, 0x9);
+                if (rc < 0)
+                        goto out;
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SPORT_MODE, 0);
+                break;
+        case 2:
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SMART_CHG, 0x9);
+                if (rc < 0)
+                        goto out;
+                rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+                                XM_PROP_SPORT_MODE, 1);
+                break;
+        }
+
+        if (rc >= 0)
+                WRITE_ONCE(bcdev->fastcharge_mode, mode);
+out:
+        mutex_unlock(&bcdev->bypass_charging_lock);
+        return rc < 0 ? rc : count;
 }
 
 static ssize_t fastcharge_enable_show(struct class *c,
-                    struct class_attribute *attr, char *buf)
+        struct class_attribute *attr, char *buf)
 {
-    struct battery_chg_dev *bcdev =
-        container_of(c, struct battery_chg_dev, battery_class);
-    struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-    int rc;
-    u32 sport_mode, smart_chg;
-    int mode;
+        struct battery_chg_dev *bcdev = container_of(c,
+                        struct battery_chg_dev, battery_class);
 
-    rc = read_property_id(bcdev, pst, XM_PROP_SPORT_MODE);
-    if (rc < 0)
-        return rc;
-    sport_mode = pst->prop[XM_PROP_SPORT_MODE];
-
-    rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
-    if (rc < 0)
-        return rc;
-    smart_chg = pst->prop[XM_PROP_SMART_CHG];
-
-    if (sport_mode == 1 && smart_chg == 8)
-        mode = 2;
-    else if (sport_mode == 0 && smart_chg == 8)
-        mode = 1;
-    else
-        mode = 0;
-
-    return scnprintf(buf, PAGE_SIZE, "%d\n", mode);
+        /*
+         * SMART_CHG is a command interface: Xiaomi firmware reports both the
+         * disable command (0x8) and the accepted enable command (0x9) as 8.
+         * Preserve the requested mode in the driver instead of reconstructing
+         * it from that ambiguous firmware readback.
+         */
+        return scnprintf(buf, PAGE_SIZE, "%d\n",
+                        READ_ONCE(bcdev->fastcharge_mode));
 }
-
 static CLASS_ATTR_RW(fastcharge_enable);
 
 QTI_CHARGER_RO_SHOW(usb_typec_compliant, PSY_TYPE_USB, USB_TYPEC_COMPLIANT);
@@ -11315,6 +11305,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	}
 
 	bcdev->restrict_fcc_ua = DEFAULT_RESTRICT_FCC_UA;
+	bcdev->fastcharge_mode = 1;
 	platform_set_drvdata(pdev, bcdev);
 	bcdev->fake_soc = -EINVAL;
 	rc = battery_chg_init_psy(bcdev);

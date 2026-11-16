@@ -1,0 +1,33 @@
+What:           /sys/class/qcom-battery/bypass_charging_enable
+Date:           November 2026
+Contact:        DirhamTzy <triyadidirham@users.noreply.github.com>
+Description:
+                Read/write control for Xiaomi firmware scene-based bypass.
+                Write 1 to request bypass and 0 to restore normal charging.
+
+                Enabling runs the selected SMART_CHG scene sequence:
+                  scene - 1, then 3
+                Disabling runs:
+                  scene - 2, then 2
+                The previous fast-charge SMART_CHG/SPORT_MODE state is saved
+                on entry and restored after bypass is disabled.
+
+                Reads return 0 or 1 for the last confirmed state and append
+                "-pending" while the asynchronous sequence is in progress.
+                A successful state transition confirms firmware scene
+                selection; electrical bypass must still be validated using
+                battery current and capacity telemetry on the device.
+
+What:           /sys/class/qcom-battery/bypass_charging_mode
+Date:           November 2026
+Contact:        DirhamTzy <triyadidirham@users.noreply.github.com>
+Description:
+                Selects the SMART_CHG thermal scene used by the next bypass
+                activation. Accepted names and indices are:
+                  0 / navigation
+                  1 / tgame
+                  2 / nolimit
+
+                Reading lists all modes and encloses the selected mode in
+                brackets. Changing the selector while bypass is active does
+                not alter the scene latched for the current transition.

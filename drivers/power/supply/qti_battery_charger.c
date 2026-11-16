@@ -912,6 +912,7 @@ struct battery_chg_dev {
 	 */
 	struct delayed_work		bypass_charging_work;
 	struct mutex			bypass_lock;
+	int				fastcharge_mode; /* accepted userspace mode */
 	int				bypass_target;   /* -1 idle, 0 disable, 1 enable in flight */
 	int				bypass_applied;  /* last confirmed-applied state, 0 or 1 */
 	int				bypass_mode_sel; /* index into bypass_modes[], set via sysfs */
@@ -3901,64 +3902,44 @@ static int fastcharge_apply_mode(struct battery_chg_dev *bcdev, int mode)
 	return 0;
 }
 
-static int fastcharge_get_mode(struct battery_chg_dev *bcdev)
-{
-	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-	int rc;
-	u32 sport_mode, smart_chg;
-
-	rc = read_property_id(bcdev, pst, XM_PROP_SPORT_MODE);
-	if (rc < 0)
-		return rc;
-	sport_mode = pst->prop[XM_PROP_SPORT_MODE];
-
-	rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
-	if (rc < 0)
-		return rc;
-	smart_chg = pst->prop[XM_PROP_SMART_CHG];
-
-	if (sport_mode == 1 && smart_chg == 8)
-		return 2;
-	else if (sport_mode == 0 && smart_chg == 8)
-		return 1;
-	else
-		return 0;
-}
-
 static ssize_t fastcharge_enable_store(struct class *c,
-                    struct class_attribute *attr,
-                    const char *buf, size_t count)
+                                struct class_attribute *attr,
+                                const char *buf, size_t count)
 {
-    struct battery_chg_dev *bcdev =
-        container_of(c, struct battery_chg_dev, battery_class);
-    int mode;
-    int rc;
+        struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+                                                battery_class);
+        int mode, rc;
 
-    rc = kstrtoint(buf, 10, &mode);
-    if (rc)
-        return -EINVAL;
+        rc = kstrtoint(buf, 0, &mode);
+        if (rc < 0)
+                return rc;
+        if (mode < 0 || mode > 2)
+                return -EINVAL;
 
-    rc = fastcharge_apply_mode(bcdev, mode);
-    if (rc < 0)
-        return rc;
+        mutex_lock(&bcdev->bypass_lock);
+        if (bcdev->bypass_applied || bcdev->bypass_target != -1) {
+                rc = -EBUSY;
+                goto out;
+        }
 
-    return count;
+        rc = fastcharge_apply_mode(bcdev, mode);
+        if (!rc)
+                WRITE_ONCE(bcdev->fastcharge_mode, mode);
+out:
+        mutex_unlock(&bcdev->bypass_lock);
+        return rc < 0 ? rc : count;
 }
 
 static ssize_t fastcharge_enable_show(struct class *c,
-                    struct class_attribute *attr, char *buf)
+                                struct class_attribute *attr, char *buf)
 {
-    struct battery_chg_dev *bcdev =
-        container_of(c, struct battery_chg_dev, battery_class);
-    int mode;
+        struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+                                                battery_class);
 
-    mode = fastcharge_get_mode(bcdev);
-    if (mode < 0)
-        return mode;
-
-    return scnprintf(buf, PAGE_SIZE, "%d\n", mode);
+        /* Firmware normalizes SMART_CHG command values; report accepted mode. */
+        return scnprintf(buf, PAGE_SIZE, "%d\n",
+                         READ_ONCE(bcdev->fastcharge_mode));
 }
-
 static CLASS_ATTR_RW(fastcharge_enable);
 
 /*
@@ -11411,6 +11392,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	}
 
 	bcdev->restrict_fcc_ua = DEFAULT_RESTRICT_FCC_UA;
+	bcdev->fastcharge_mode = 1;
 	platform_set_drvdata(pdev, bcdev);
 	bcdev->fake_soc = -EINVAL;
 	rc = battery_chg_init_psy(bcdev);

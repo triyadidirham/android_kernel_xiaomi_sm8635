@@ -1076,6 +1076,7 @@
   down_read
   down_write
   find_vma
+  mtree_load
   __mmap_lock_do_trace_acquire_returned
   __mmap_lock_do_trace_released
   __mmap_lock_do_trace_start_locking
@@ -1932,6 +1933,7 @@
   driver_set_override
   platform_device_add
   platform_device_alloc
+  platform_device_del
   platform_device_put
 
 # required by slimbus.ko

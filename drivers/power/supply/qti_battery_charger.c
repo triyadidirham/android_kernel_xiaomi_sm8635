@@ -4071,6 +4071,31 @@ static void bypass_build_revert(struct battery_chg_dev *bcdev)
 }
 
 /*
+ * Fail closed when the wired charger status cannot be read. Checking both
+ * ports keeps the bypass ABI consistent with USB power-supply reporting.
+ * GLINK reads can sleep, so never call this under bypass_lock.
+ */
+static int bypass_usb_online(struct battery_chg_dev *bcdev)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
+	int rc;
+
+	rc = read_property_id(bcdev, pst, USB_ONLINE);
+	if (rc < 0)
+		return rc;
+	if (pst->prop[USB_ONLINE])
+		return 1;
+	if (bcdev->num_usb_ports != 2)
+		return 0;
+
+	pst = &bcdev->psy_list[PSY_TYPE_USB_2];
+	rc = read_property_id(bcdev, pst, USB_ONLINE);
+	if (rc < 0)
+		return rc;
+	return !!pst->prop[USB_ONLINE];
+}
+
+/*
  * Bypass charging: runs off adapter power without cycling the battery.
  * Targets the scene selected via bypass_charging_mode (see bypass_modes[]).
  * Engage/revert values are derived from that scene number —
@@ -4198,6 +4223,13 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP)
 		return -ENOTCONN;
 
+	/* Disabling is always allowed; enabling requires live wired power. */
+	if (val) {
+		rc = bypass_usb_online(bcdev);
+		if (rc <= 0)
+			return rc < 0 ? rc : -ENOTCONN;
+	}
+
 	/*
 	 * Snapshot the fastcharge state before taking the lock: these are
 	 * glink round-trips and must not sleep under bypass_lock.
@@ -4256,6 +4288,10 @@ static ssize_t bypass_charging_enable_show(struct class *c,
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
 	int applied, in_flight;
+
+	/* Never advertise bypass as active while no wired adapter is present. */
+	if (bypass_usb_online(bcdev) <= 0)
+		return scnprintf(buf, PAGE_SIZE, "0\n");
 
 	mutex_lock(&bcdev->bypass_lock);
 	applied = bcdev->bypass_applied;

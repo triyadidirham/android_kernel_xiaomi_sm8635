@@ -1647,6 +1647,11 @@ bool cpu_busy_with_softirqs(int cpu)
 
 	return softirqs & LONG_SOFTIRQ_MASK;
 }
+
+bool local_rt_runnable(void)
+{
+	return sched_rt_runnable(this_rq());
+}
 #else
 bool cpu_busy_with_softirqs(int cpu)
 {
@@ -2871,7 +2876,7 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 {
 	struct rt_schedulable_data *d = data;
 	struct task_group *child;
-	unsigned long total, sum = 0;
+	u64 total, sum = 0;
 	u64 period, runtime;
 
 	period = ktime_to_ns(tg->rt_bandwidth.rt_period);
